@@ -1,0 +1,319 @@
+name: build_and_deploy
+
+on:
+  push:
+    branches: [develop]
+
+concurrency:
+  group: campaigns-pharmachatbot-deploy-dev-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+
+    steps:
+      - name: Notificar Discord - Build Iniciado
+        run: |
+          curl -H "Content-Type: application/json" \
+               -d '{
+                 "embeds": [{
+                   "title": "🚀 Build Iniciado - Campaigns Pharmachatbot",
+                   "color": 3447003,
+                   "fields": [
+                     {"name": "Branch", "value": "${{ github.ref_name }}", "inline": true},
+                     {"name": "Autor", "value": "${{ github.actor }}", "inline": true},
+                     {"name": "Commit", "value": "```${{ github.event.head_commit.message }}```", "inline": false}
+                   ],
+                   "timestamp": "${{ github.event.head_commit.timestamp }}"
+                 }]
+               }' \
+               "${{ secrets.DISCORD_WEBHOOK_URL }}"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.9.0'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build the app
+        run: npm run build
+
+      - name: Log in to Oracle Cloud Container Registry
+        run: echo "${{ secrets.ORACLE_REGISTRY_PASSWORD }}" | docker login vcp.ocir.io -u ${{ vars.ORACLE_REGISTRY_USERNAME}} --password-stdin
+
+      - name: Resolve Docker Tag
+        id: tag
+        run: |
+          git fetch --tags --force --prune
+
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+            echo "🏷️ Usando tag Git: ${TAG}"
+            
+          elif TAG=$(git describe --exact-match --tags HEAD 2>/dev/null); then
+            echo "🎯 Tag encontrada no commit atual: ${TAG}"
+            
+          elif git show --format="%s" --no-patch HEAD | grep -E "(chore: bump version|release|chore\(release\))"; then
+            PACKAGE_VERSION=$(node -p "require('./package.json').version" 2>/dev/null || echo "0.0.0")
+            TAG="v${PACKAGE_VERSION}"
+            echo "🚀 Commit de release detectado: ${TAG}"
+            
+            if ! git rev-parse "${TAG}" >/dev/null 2>&1; then
+              echo "📌 Criando tag ${TAG} no commit atual"
+              git tag "${TAG}"
+              git push origin "${TAG}" || echo "⚠️ Aviso: Não foi possível fazer push da tag (normal em dry-run)"
+            else
+              echo "⚠️ Tag ${TAG} já existe"
+            fi
+            
+          else
+            PACKAGE_VERSION=$(node -p "require('./package.json').version" 2>/dev/null || echo "0.0.0")
+            BRANCH_NAME=$(echo "${GITHUB_REF_NAME}" | sed 's/[^a-zA-Z0-9.-]/-/g')
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            
+            if [ "${GITHUB_REF_NAME}" = "main" ] || [ "${GITHUB_REF_NAME}" = "master" ]; then
+              TAG="v${PACKAGE_VERSION}-${SHORT_SHA}"
+            else
+              TAG="v${PACKAGE_VERSION}-${BRANCH_NAME}-${SHORT_SHA}"
+            fi
+            
+            echo "🔧 Tag gerada: ${TAG}"
+          fi
+
+          echo "TAG=${TAG}" >> $GITHUB_ENV
+          echo "📦 Tag final para Docker: ${TAG}"
+
+      - name: Build docker Image
+        run: |
+          docker build -t vcp.ocir.io/axasusetme4p/campaigns-pharmachatbot:${{ env.TAG }} .
+          docker image tag vcp.ocir.io/axasusetme4p/campaigns-pharmachatbot:${{ env.TAG }} vcp.ocir.io/axasusetme4p/campaigns-pharmachatbot:latest
+
+      - name: Push docker Image
+        run: |
+          docker push vcp.ocir.io/axasusetme4p/campaigns-pharmachatbot:${{ env.TAG }}
+          docker push vcp.ocir.io/axasusetme4p/campaigns-pharmachatbot:latest
+
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: infra-pharma-chat-bot-dev
+
+      - name: Update Chart and Create PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const infraRepo = {
+              owner: context.repo.owner,
+              repo: 'infra-pharma-chat-bot-dev'
+            };
+
+            const newTag = process.env.TAG;
+            const branchName = `atualizar-campaigns-pharmachatbot-${newTag}`;
+
+            try {
+              const { data: repoData } = await github.rest.repos.get({
+                owner: infraRepo.owner,
+                repo: infraRepo.repo
+              });
+              const defaultBranch = repoData.default_branch;
+              
+              try {
+                const { data: baseChart } = await github.rest.repos.getContent({
+                  owner: infraRepo.owner,
+                  repo: infraRepo.repo,
+                  path: 'campaigns-pharmachatbot/Chart.yaml',
+                  ref: defaultBranch,
+                });
+                const baseContent = Buffer.from(baseChart.content, 'base64').toString('utf-8');
+                const desiredVersionLine = `version: ${newTag}`;
+                const desiredAppVersionLine = `appVersion: "${newTag}"`;
+                if (baseContent.includes(desiredVersionLine) && baseContent.includes(desiredAppVersionLine)) {
+                  core.info(`Chart.yaml já está atualizado para ${newTag}. Nada a fazer.`);
+                  return;
+                }
+              } catch (e) {
+                core.warning(`Não foi possível ler Chart.yaml do branch base (${defaultBranch}): ${e.message}`);
+              }
+
+              const { data: refData } = await github.rest.git.getRef({
+                owner: infraRepo.owner,
+                repo: infraRepo.repo,
+                ref: `heads/${defaultBranch}`
+              });
+              const latestCommitSha = refData.object.sha;
+              
+              let branchExists = false;
+              try {
+                await github.rest.git.getRef({
+                  owner: infraRepo.owner,
+                  repo: infraRepo.repo,
+                  ref: `heads/${branchName}`,
+                });
+                branchExists = true;
+                core.info(`Branch ${branchName} já existe. Será reutilizada.`);
+              } catch (_) {
+                await github.rest.git.createRef({
+                  owner: infraRepo.owner,
+                  repo: infraRepo.repo,
+                  ref: `refs/heads/${branchName}`,
+                  sha: latestCommitSha
+                });
+                core.info(`Branch ${branchName} criada.`);
+              }
+              
+              const { data: chartFile } = await github.rest.repos.getContent({
+                owner: infraRepo.owner,
+                repo: infraRepo.repo,
+                path: 'campaigns-pharmachatbot/Chart.yaml',
+                ref: branchName
+              });
+              
+              const chartContent = Buffer.from(chartFile.content, 'base64').toString('utf-8');
+              const updatedContent = chartContent
+                .replace(/^version: .+$/m, `version: ${newTag}`)
+                .replace(/^appVersion: .+$/m, `appVersion: "${newTag}"`);
+              
+              await github.rest.repos.createOrUpdateFileContents({
+                owner: infraRepo.owner,
+                repo: infraRepo.repo,
+                path: 'campaigns-pharmachatbot/Chart.yaml',
+                message: `chore: atualizar campaigns-pharmachatbot para versão ${newTag}`,
+                content: Buffer.from(updatedContent).toString('base64'),
+                sha: chartFile.sha,
+                branch: branchName
+              });
+              
+              const prTitle = `Atualizar campaigns-pharmachatbot para versão ${newTag}`;
+              const headRef = `${infraRepo.owner}:${branchName}`;
+              const { data: existingPrs } = await github.rest.pulls.list({
+                owner: infraRepo.owner,
+                repo: infraRepo.repo,
+                state: 'open',
+                head: headRef,
+                base: defaultBranch,
+              });
+
+              let pullRequest;
+              if (existingPrs.length > 0) {
+                pullRequest = existingPrs[0];
+                core.info(`PR já existe: ${pullRequest.html_url}`);
+              } else {
+                const prCreate = await github.rest.pulls.create({
+                  owner: infraRepo.owner,
+                  repo: infraRepo.repo,
+                  title: prTitle,
+                  body: `
+              🚀 **Atualização Automática do Chart**
+              
+              Este PR atualiza automaticamente o chart do \`campaigns-pharmachatbot\` com a nova versão da imagem.
+              
+              **Alterações:**
+              - Versão do Chart: \`${newTag}\`
+              - Versão da App: \`${newTag}\`
+              - Tag da imagem: \`vcp.ocir.io/axasusetme4p/campaigns-pharmachatbot:${newTag}\`
+              
+              **Disparado por:** Push no repositório campaigns-pharmachatbot
+              **Commit:** ${{ github.sha }}
+              
+              ---
+              *Este PR foi criado automaticamente pelo GitHub Actions*
+                `,
+                  head: branchName,
+                  base: defaultBranch
+                });
+                pullRequest = prCreate.data;
+                console.log(`Pull Request criado com sucesso: ${pullRequest.html_url}`);
+              }
+              
+              await new Promise(resolve => setTimeout(resolve, 5000));
+              
+              try {
+                await github.rest.pulls.merge({
+                  owner: infraRepo.owner,
+                  repo: infraRepo.repo,
+                  pull_number: pullRequest.number,
+                  commit_title: `Merge: atualizar campaigns-pharmachatbot para versão ${newTag}`,
+                  commit_message: `Merge automático do PR #${pullRequest.number}\n\nVersão: ${newTag}\nCommit origem: ${{ github.sha }}`,
+                  merge_method: 'merge'
+                });
+                
+                console.log(`PR #${pullRequest.number} merged automaticamente com sucesso`);
+                
+                await github.rest.git.deleteRef({
+                  owner: infraRepo.owner,
+                  repo: infraRepo.repo,
+                  ref: `heads/${branchName}`
+                });
+                
+                console.log(`Branch ${branchName} removida com sucesso`);
+                
+              } catch (mergeError) {
+                console.warn(`Aviso: Não foi possível fazer merge automático: ${mergeError.message}`);
+                console.log('O PR foi criado e precisa ser aprovado manualmente');
+              }
+              
+            } catch (error) {
+              console.error('Erro ao criar PR:', error);
+              throw error;
+            }
+
+      - name: Notificar Discord - Deploy Sucesso
+        if: success()
+        run: |
+          curl -H "Content-Type: application/json" \
+               -d '{
+                 "embeds": [{
+                   "title": "✅ Deploy Automático Concluído",
+                   "color": 5763719,
+                   "description": "Campaigns Pharmachatbot atualizado com sucesso!",
+                   "fields": [
+                     {"name": "Nova Versão", "value": "`${{ env.TAG }}`", "inline": true},
+                     {"name": "Branch", "value": "${{ github.ref_name }}", "inline": true},
+                     {"name": "Imagem", "value": "`vcp.ocir.io/axasusetme4p/campaigns-pharmachatbot:${{ env.TAG }}`", "inline": false},
+                     {"name": "Status", "value": "🎉 Pronto para produção", "inline": true}
+                   ],
+                   "footer": {"text": "Merge automático executado"},
+                   "timestamp": "${{ github.event.head_commit.timestamp }}"
+                 }]
+               }' \
+               "${{ secrets.DISCORD_WEBHOOK_URL }}"
+
+      - name: Notificar Discord - Build Falhou
+        if: failure()
+        run: |
+          curl -H "Content-Type: application/json" \
+               -d '{
+                 "embeds": [{
+                   "title": "❌ Build Falhou - Campaigns Pharmachatbot",
+                   "color": 15158332,
+                   "fields": [
+                     {"name": "Branch", "value": "${{ github.ref_name }}", "inline": true},
+                     {"name": "Autor", "value": "${{ github.actor }}", "inline": true},
+                     {"name": "Erro", "value": "Verificar logs para detalhes", "inline": false},
+                     {"name": "Logs", "value": "[Ver aqui](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": false}
+                   ],
+                   "timestamp": "${{ github.event.head_commit.timestamp }}"
+                 }]
+               }' \
+               "${{ secrets.DISCORD_WEBHOOK_URL }}"
+

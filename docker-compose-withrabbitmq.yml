@@ -1,0 +1,38 @@
+version: '3.7'
+networks:
+  greenchat_campaigns:
+
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq-greenchat1_${CONTAINER_NAME}
+    restart: always
+    networks:
+      - greenchat_campaigns
+    env_file:
+      - .env
+    volumes:
+      - ./data/rabbitmq:/var/lib/rabbitmq/
+    ports:
+      - ${RABBITMQ_PORT1}:${RABBITMQ_PORT1}
+      - ${RABBITMQ_PORT2}:${RABBITMQ_PORT2}
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS}
+  app:
+    restart: always
+    container_name: campaigns-greenchat_${CONTAINER_NAME}
+    networks:
+      - greenchat_campaigns
+    volumes:
+      - ./data:/logs
+    build:
+      network: host
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - rabbitmq
+    env_file:
+      - .env
+    ports:
+      - '${FASTIFY_PORT}:${FASTIFY_PORT}'

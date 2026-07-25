@@ -1,0 +1,16 @@
+node_modules
+data
+.env
+.env.example
+.gitignore
+docker-compose.yml
+.dockerignore
+Dockerfile
+.github
+.eslintignore
+.eslintrc.json
+yarn.lock
+README.md
+.DS_Store
+/data
+/data/*

@@ -1,0 +1,257 @@
+name: build_and_deploy
+
+on:
+  workflow_run:
+    workflows: ["release"]
+    types:
+      - completed
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    permissions:
+      contents: write
+      pull-requests: read
+
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+          ref: main
+
+      - name: Definir metadados da release
+        id: release-metadata
+        run: |
+          VERSION=$(jq -r '.version' package.json)
+          BASE_TAG="v${VERSION}"
+          COMMIT_SHA="${{ github.event.workflow_run.head_sha }}"
+          SHORT_SHA=${COMMIT_SHA:0:7}
+          TAG="${BASE_TAG}-${SHORT_SHA}"
+
+          echo "BASE_TAG=${BASE_TAG}" >> $GITHUB_ENV
+          echo "TAG=${TAG}" >> $GITHUB_ENV
+          echo "COMMIT_SHA=${COMMIT_SHA}" >> $GITHUB_ENV
+          echo "RELEASE_TITLE=${BASE_TAG}" >> $GITHUB_ENV
+
+          echo "📦 Tag base da release: ${BASE_TAG}"
+          echo "🔖 Tag da imagem: ${TAG}"
+
+      - name: Buscar título da release
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const baseTag = process.env.BASE_TAG;
+
+            if (!baseTag) {
+              core.warning('BASE_TAG não definido. Mantendo título padrão.');
+              return;
+            }
+
+            try {
+              const { data } = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: baseTag
+              });
+
+              const title = data.name || baseTag;
+              core.exportVariable('RELEASE_TITLE', title);
+            } catch (error) {
+              core.warning(`Não foi possível obter release ${baseTag}: ${error.message}`);
+            }
+
+      - name: Notificar Discord - Build Iniciado
+        uses: Ilshidur/action-discord@master
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        with:
+          args: |
+            🚀 **Deploy de Release Iniciado - Campaigns Pharmachatbot**
+
+            **Release:** `${{ env.BASE_TAG }}`
+            **Autor:** ${{ github.event.workflow_run.actor.login }}
+            **Título:** ${{ env.RELEASE_TITLE }}
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.9.0"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build the app
+        run: npm run build
+
+      - name: Log in to Oracle Cloud Container Registry
+        run: echo "${{ secrets.ORACLE_REGISTRY_PASSWORD }}" | docker login vcp.ocir.io -u ${{ vars.ORACLE_REGISTRY_USERNAME}} --password-stdin
+
+      - name: Build docker Image
+        run: |
+          docker build -f Dockerfile -t vcp.ocir.io/axasusetme4p/campaigns-pharmachatbot:${{ env.TAG }} .
+          docker image tag vcp.ocir.io/axasusetme4p/campaigns-pharmachatbot:${{ env.TAG }} vcp.ocir.io/axasusetme4p/campaigns-pharmachatbot:latest
+
+      - name: Push docker Image
+        run: |
+          docker push vcp.ocir.io/axasusetme4p/campaigns-pharmachatbot:${{ env.TAG }}
+          docker push vcp.ocir.io/axasusetme4p/campaigns-pharmachatbot:latest
+
+      - name: Update Chart and Create PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const infraRepo = {
+              owner: context.repo.owner,
+              repo: 'infra-pharma-chat-bot'
+            };
+
+            const newTag = process.env.TAG;
+            const branchName = `atualizar-campaigns-pharmachatbot-${newTag}`;
+
+            try {
+              const { data: repoData } = await github.rest.repos.get({
+                owner: infraRepo.owner,
+                repo: infraRepo.repo
+              });
+              const defaultBranch = repoData.default_branch;
+              
+              const { data: refData } = await github.rest.git.getRef({
+                owner: infraRepo.owner,
+                repo: infraRepo.repo,
+                ref: `heads/${defaultBranch}`
+              });
+              const latestCommitSha = refData.object.sha;
+              
+              await github.rest.git.createRef({
+                owner: infraRepo.owner,
+                repo: infraRepo.repo,
+                ref: `refs/heads/${branchName}`,
+                sha: latestCommitSha
+              });
+              
+              const { data: chartFile } = await github.rest.repos.getContent({
+                owner: infraRepo.owner,
+                repo: infraRepo.repo,
+                path: 'campaigns-pharmachatbot/Chart.yaml',
+                ref: branchName
+              });
+              
+              const chartContent = Buffer.from(chartFile.content, 'base64').toString('utf-8');
+              const updatedContent = chartContent
+                .replace(/^version: .+$/m, `version: ${newTag}`)
+                .replace(/^appVersion: .+$/m, `appVersion: "${newTag}"`);
+              
+              await github.rest.repos.createOrUpdateFileContents({
+                owner: infraRepo.owner,
+                repo: infraRepo.repo,
+                path: 'campaigns-pharmachatbot/Chart.yaml',
+                message: `chore: atualizar campaigns-pharmachatbot para versão ${newTag}`,
+                content: Buffer.from(updatedContent).toString('base64'),
+                sha: chartFile.sha,
+                branch: branchName
+              });
+              
+              const { data: pullRequest } = await github.rest.pulls.create({
+                owner: infraRepo.owner,
+                repo: infraRepo.repo,
+                title: `Atualizar campaigns-pharmachatbot para versão ${newTag}`,
+                body: `
+              🚀 **Atualização Automática do Chart**
+              
+              Este PR atualiza automaticamente o chart do \`campaigns-pharmachatbot\` com a nova versão da imagem.
+              
+              **Alterações:**
+              - Versão do Chart: \`${newTag}\`
+              - Versão da App: \`${newTag}\`
+              - Tag da imagem: \`vcp.ocir.io/axasusetme4p/campaigns-pharmachatbot:${newTag}\`
+              
+              **Disparado por:** Push no repositório campaigns-pharmachatbot
+              **Commit:** ${{ github.sha }}
+              
+              ---
+              *Este PR foi criado automaticamente pelo GitHub Actions*
+                `,
+                head: branchName,
+                base: defaultBranch
+              });
+              
+              console.log(`Pull Request criado com sucesso: ${pullRequest.html_url}`);
+              
+              await new Promise(resolve => setTimeout(resolve, 5000));
+              
+              try {
+                await github.rest.pulls.merge({
+                  owner: infraRepo.owner,
+                  repo: infraRepo.repo,
+                  pull_number: pullRequest.number,
+                  commit_title: `Merge: atualizar campaigns-pharmachatbot para versão ${newTag}`,
+                  commit_message: `Merge automático do PR #${pullRequest.number}\n\nVersão: ${newTag}\nCommit origem: ${{ github.sha }}`,
+                  merge_method: 'merge'
+                });
+                
+                console.log(`PR #${pullRequest.number} merged automaticamente com sucesso`);
+                
+                await github.rest.git.deleteRef({
+                  owner: infraRepo.owner,
+                  repo: infraRepo.repo,
+                  ref: `heads/${branchName}`
+                });
+                
+                console.log(`Branch ${branchName} removida com sucesso`);
+                
+              } catch (mergeError) {
+                console.warn(`Aviso: Não foi possível fazer merge automático: ${mergeError.message}`);
+                console.log('O PR foi criado e precisa ser aprovado manualmente');
+              }
+              
+            } catch (error) {
+              console.error('Erro ao criar PR:', error);
+              throw error;
+            }
+
+      - name: Notificar Discord - Deploy Sucesso
+        if: success()
+        uses: Ilshidur/action-discord@master
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        with:
+          args: |
+            ✅ **Deploy de Release Concluído**
+
+            Campaigns Pharmachatbot atualizado com sucesso!
+
+            **Release:** `${{ env.TAG }}`
+            **Título:** ${{ env.RELEASE_TITLE }}
+            **Imagem:** `vcp.ocir.io/axasusetme4p/campaigns-pharmachatbot:${{ env.TAG }}`
+            **Status:** 🎉 Pronto para produção
+
+            *Deploy automático de release executado*
+
+      - name: Notificar Discord - Build Falhou
+        if: failure()
+        uses: Ilshidur/action-discord@master
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        with:
+          args: |
+            ❌ **Deploy de Release Falhou - Campaigns Pharmachatbot**
+
+            **Release:** `${{ env.BASE_TAG }}`
+            **Autor:** ${{ github.event.workflow_run.actor.login }}
+            **Erro:** Verificar logs para detalhes
+            **Logs:** [Ver aqui](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
