@@ -6,6 +6,7 @@ import { queueConfig } from '@/configs';
 import log from '@/logs';
 import { runCron } from '@/services/schedule/runCron';
 // import campaignWorker from '@/workers/campaign.worker';
+import disparoWorker from '@/workers/disparo.worker';
 import reportWorker from '@/workers/report.worker';
 
 export type JobType =
@@ -477,6 +478,9 @@ export async function startQueues() {
 		queueConfig.queues.remove,
 		bullMQ.processRemoveJob.bind(bullMQ),
 	);
+
+	bullMQ.createQueue(queueConfig.queues.disparo);
+	await bullMQ.processJob(queueConfig.queues.disparo, disparoWorker, 5);
 
 	log.info({
 		module: 'system',

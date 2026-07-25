@@ -32,6 +32,14 @@ const envSchema = z.object({
 	API_CAMPAIGN_INIT_CHATBOT: z.coerce.string().default('http://localhost:9010'),
 	CAMPAIGN_CHATBOT_API_KEY: z.coerce.string().default('devsecret'),
 	SECRET_ACCESS_KEY: z.coerce.string().default('secretkey123'),
+
+	// ── Motor de disparo via Evolution API ──────────────────────────────
+	// Instância/credenciais da Evolution que o campanhas usa para disparar.
+	EVOLUTION_API_URL: z.coerce.string().default(''),
+	EVOLUTION_API_KEY: z.coerce.string().default(''),
+	// Segredo compartilhado com o PharmaFlow (header x-internal-key) para
+	// autenticar as chamadas internas entre os dois sistemas.
+	INTERNAL_API_KEY: z.coerce.string().default('devinternalkey'),
 });
 
 const _env = envSchema.safeParse(process.env);

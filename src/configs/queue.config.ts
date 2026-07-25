@@ -29,6 +29,7 @@ const queueConfig: IQueue = {
 		report: 'report',
 		cron: 'cron',
 		remove: 'remove',
+		disparo: 'disparo',
 	},
 
 	schedulers: {
