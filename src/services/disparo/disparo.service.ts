@@ -55,8 +55,11 @@ export async function executarDisparo(
 				await sleep(DELAY_ENTRE_ENVIOS_MS);
 			}
 
-			// 2) Cada criativo, com a própria legenda
+			// 2) Cada criativo, com a própria legenda. Na primeira falha o grupo
+			// para: com a Evolution respondendo erro, cada peça seguinte pode
+			// virar mais uma mensagem quebrada no grupo do cliente.
 			for (const midia of medias) {
+				if (erros.length) break;
 				const r = await evolution.sendMedia(grupo.jid, {
 					media: midia.b64,
 					mimetype: midia.mime || 'image/png',

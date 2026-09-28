@@ -21,6 +21,15 @@ const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 2000;
 
 /**
+ * Erros em que o pedido comprovadamente NÃO chegou na Evolution — só esses
+ * podem ser repetidos. Envio de mensagem não é idempotente: em 24/09 a
+ * Evolution respondeu 500 depois de já ter postado no grupo, e cada retry
+ * virou mais uma mensagem em branco (12 por grupo, em 8 grupos). Resposta HTTP
+ * de erro ou timeout = não sabemos se saiu, então não repete.
+ */
+const ERROS_ANTES_DE_CHEGAR = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+
+/**
  * Transporte de WhatsApp via Evolution API.
  *
  * Espelha exatamente o contrato usado pelo PharmaFlow (mesma Evolution):
@@ -52,8 +61,9 @@ export default class EvolutionInstance {
 	}
 
 	/**
-	 * Faz a requisição com retry. Nunca lança: devolve { ok:false } quando
-	 * esgota as tentativas, para o laço de grupos decidir por grupo.
+	 * Faz a requisição, repetindo só quando o pedido não chegou na Evolution
+	 * (ver ERROS_ANTES_DE_CHEGAR). Nunca lança: devolve { ok:false } quando
+	 * falha, para o laço de grupos decidir por grupo.
 	 */
 	private async request(
 		path: string,
@@ -70,7 +80,9 @@ export default class EvolutionInstance {
 			const status = error?.response?.status ?? 0;
 			const data = error?.response?.data ?? error?.message ?? String(error);
 
-			if (retry < MAX_RETRIES) {
+			const naoChegou = !error?.response && ERROS_ANTES_DE_CHEGAR.has(error?.code);
+
+			if (naoChegou && retry < MAX_RETRIES) {
 				log.info({
 					success: false,
 					module: 'services',
