@@ -27,7 +27,11 @@ const RETRY_DELAY_MS = 2000;
  * virou mais uma mensagem em branco (12 por grupo, em 8 grupos). Resposta HTTP
  * de erro ou timeout = não sabemos se saiu, então não repete.
  */
-const ERROS_ANTES_DE_CHEGAR = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+const ERROS_ANTES_DE_CHEGAR = new Set([
+	'ECONNREFUSED',
+	'ENOTFOUND',
+	'EAI_AGAIN',
+]);
 
 /**
  * Transporte de WhatsApp via Evolution API.
@@ -80,7 +84,8 @@ export default class EvolutionInstance {
 			const status = error?.response?.status ?? 0;
 			const data = error?.response?.data ?? error?.message ?? String(error);
 
-			const naoChegou = !error?.response && ERROS_ANTES_DE_CHEGAR.has(error?.code);
+			const naoChegou =
+				!error?.response && ERROS_ANTES_DE_CHEGAR.has(error?.code);
 
 			if (naoChegou && retry < MAX_RETRIES) {
 				log.info({
